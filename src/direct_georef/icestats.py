@@ -99,8 +99,13 @@ def compute_ice_stats(
     if not _CV2_AVAILABLE:
         raise ImportError("opencv-python is required for compute_ice_stats()")
 
-    gsd = georect.gsd_m
     binary = (mask > 0).astype(np.uint8) * 255
+    mask_wh = (binary.shape[1], binary.shape[0])  # (width, height)
+
+    # Effective GSD at mask scale
+    W_full = georect.camera.width or georect.metadata.image_width
+    scale = binary.shape[1] / W_full if W_full else 1.0
+    gsd = georect.gsd_m / scale  # GSD at mask resolution
 
     # Connected components
     n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
@@ -121,9 +126,9 @@ def compute_ice_stats(
 
         cx, cy = centroids[lbl]  # (col, row) from OpenCV
 
-        # Geographic centroid
+        # Geographic centroid (pass mask dims so downscaled masks map correctly)
         lat_arr, lon_arr = _pixel_to_latlon(
-            np.array([cx]), np.array([cy]), georect
+            np.array([cx]), np.array([cy]), georect, _wh=mask_wh
         )
         cent_lat = float(lat_arr[0])
         cent_lon = float(lon_arr[0])

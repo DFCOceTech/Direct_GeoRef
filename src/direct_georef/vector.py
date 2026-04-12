@@ -37,6 +37,7 @@ def _pixel_to_latlon(
     u: np.ndarray,
     v: np.ndarray,
     georect: GeoRect,
+    _wh: Optional[tuple[int, int]] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Bilinear interpolation from pixel (col u, row v) to geographic lat/lon.
 
@@ -49,6 +50,9 @@ def _pixel_to_latlon(
     ----------
     u : column indices (float), shape arbitrary
     v : row indices (float), shape arbitrary
+    _wh : (width, height) of the coordinate space for u/v.  If None, uses the
+        GeoRect camera/metadata image dimensions.  Pass the mask shape when u/v
+        come from a downscaled mask so bilinear parameters stay in [0, 1].
 
     Returns
     -------
@@ -57,18 +61,26 @@ def _pixel_to_latlon(
     u = np.asarray(u, dtype=np.float64)
     v = np.asarray(v, dtype=np.float64)
 
-    W = georect.camera.width or georect.metadata.image_width
-    H = georect.camera.height or georect.metadata.image_height
+    if _wh is not None:
+        W, H = _wh
+    else:
+        W = georect.camera.width or georect.metadata.image_width
+        H = georect.camera.height or georect.metadata.image_height
 
     if georect.lat_grid is not None:
-        # Nearest-pixel lookup in the full grid
-        col = np.clip(np.round(u).astype(int), 0, W - 1)
-        row = np.clip(np.round(v).astype(int), 0, H - 1)
+        # Nearest-pixel lookup in the full grid (always full-res dims)
+        W_full = georect.lat_grid.shape[1]
+        H_full = georect.lat_grid.shape[0]
+        # Map u/v from _wh space → full-res space
+        u_full = u * (W_full - 1) / max(W - 1, 1)
+        v_full = v * (H_full - 1) / max(H - 1, 1)
+        col = np.clip(np.round(u_full).astype(int), 0, W_full - 1)
+        row = np.clip(np.round(v_full).astype(int), 0, H_full - 1)
         return georect.lat_grid[row, col], georect.lon_grid[row, col]
 
     # Bilinear interpolation from 4 corner GCPs
-    t = u / (W - 1)   # horizontal parameter [0, 1]
-    s = v / (H - 1)   # vertical   parameter [0, 1]
+    t = u / max(W - 1, 1)   # horizontal parameter [0, 1]
+    s = v / max(H - 1, 1)   # vertical   parameter [0, 1]
 
     lat_TL, lon_TL = georect.corners_latlon["TL"]
     lat_TR, lon_TR = georect.corners_latlon["TR"]
@@ -90,6 +102,7 @@ def _pixel_to_latlon(
 def _contour_to_polygon(
     contour: np.ndarray,
     georect: GeoRect,
+    _wh: Optional[tuple[int, int]] = None,
 ) -> Optional[Polygon]:
     """Convert an OpenCV contour (N×1×2 int32) to a shapely Polygon in WGS-84.
 
@@ -102,7 +115,7 @@ def _contour_to_polygon(
     u = pts[:, 0].astype(np.float64)
     v = pts[:, 1].astype(np.float64)
 
-    lat, lon = _pixel_to_latlon(u, v, georect)
+    lat, lon = _pixel_to_latlon(u, v, georect, _wh=_wh)
     coords = list(zip(lon, lat))  # GeoJSON convention: (lon, lat)
 
     try:
@@ -148,18 +161,25 @@ def ice_mask_to_polygons(
 
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    gsd = georect.gsd_m
+    # Use actual mask dimensions for pixel→geo transform so downscaled masks work correctly
+    mask_wh = (binary.shape[1], binary.shape[0])  # (width, height)
+
+    # Effective GSD at mask scale = gsd_full * (W_full / W_mask)
+    W_full = georect.camera.width or georect.metadata.image_width
+    scale = binary.shape[1] / W_full if W_full else 1.0
+    gsd_eff = georect.gsd_m / scale  # GSD at the mask's resolution
+
     rows: list[dict] = []
     blob_id = 0
 
     for contour in contours:
         area_px = cv2.contourArea(contour)
-        area_m2 = area_px * gsd * gsd
+        area_m2 = area_px * gsd_eff * gsd_eff
 
         if area_m2 < min_area_m2:
             continue
 
-        poly = _contour_to_polygon(contour, georect)
+        poly = _contour_to_polygon(contour, georect, _wh=mask_wh)
         if poly is None:
             continue
 

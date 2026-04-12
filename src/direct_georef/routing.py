@@ -161,28 +161,39 @@ def _remove_small_blobs(
     return result
 
 
-def _find_auto_endpoint(
+def _find_auto_endpoint_geo(
     navigable: np.ndarray,
+    lat_grid: np.ndarray,
     northmost: bool,
 ) -> Optional[tuple[int, int]]:
-    """Find the northernmost (or southernmost) ice-free midpoint column.
+    """Find the geographically northernmost (or southernmost) navigable pixel.
+
+    Uses a precomputed latitude grid so that rotated (non-north-up) imagery
+    is handled correctly — row 0 is not always the northernmost latitude.
 
     Parameters
     ----------
-    navigable : (H, W) bool — True where navigable.
-    northmost : If True, search from top (row 0); else from bottom.
+    navigable : (H, W) bool — True where the ship may travel.
+    lat_grid  : (H, W) float — geographic latitude for each routing pixel.
+    northmost : If True, return the pixel with the highest latitude;
+                else return the pixel with the lowest latitude.
 
     Returns
     -------
-    (row, col) or None if no navigable pixel found.
+    (row, col) or None if no navigable pixel exists.
     """
-    rows = range(navigable.shape[0]) if northmost else range(navigable.shape[0] - 1, -1, -1)
-    for r in rows:
-        cols = np.where(navigable[r])[0]
-        if len(cols) > 0:
-            mid_col = int((int(cols[0]) + int(cols[-1])) // 2)
-            return (r, mid_col)
-    return None
+    if not navigable.any():
+        return None
+
+    if northmost:
+        masked = np.where(navigable, lat_grid, -np.inf)
+        idx = int(np.argmax(masked))
+    else:
+        masked = np.where(navigable, lat_grid, np.inf)
+        idx = int(np.argmin(masked))
+
+    r, c = np.unravel_index(idx, navigable.shape)
+    return (int(r), int(c))
 
 
 # ---------------------------------------------------------------------------
@@ -234,20 +245,29 @@ def find_route(
 
     ship_speed_ms = ship_speed_kn * _KN_TO_MS
 
-    # ---- GSD at routing scale ----
-    gsd_full = georect.gsd_m
-    gsd_proc = gsd_full / routing_scale  # GSD in metres at routing scale
+    # ---- Image dimensions and scale factors ----
+    W_full = georect.camera.width or georect.metadata.image_width
+    H_full = georect.camera.height or georect.metadata.image_height
 
-    # ---- Downscale mask ----
+    # ---- Downscale mask to routing grid ----
     H_orig, W_orig = mask.shape[:2]
     H_proc = max(1, int(round(H_orig * routing_scale)))
     W_proc = max(1, int(round(W_orig * routing_scale)))
 
+    # Mapping from routing pixel → full-res pixel (accounts for any input mask scale)
+    col_to_full = W_full / max(W_proc, 1)
+    row_to_full = H_full / max(H_proc, 1)
+
+    # GSD of the routing grid, computed from the actual pixel-to-full-res ratio
+    gsd_proc = georect.gsd_m * col_to_full
+
     binary_full = (mask > 0).astype(np.uint8) * 255
 
-    # ---- Remove small floes from full-res mask ----
+    # ---- Remove small floes from input mask ----
     if min_floe_area_m2 > 0.0:
-        min_area_px = min_floe_area_m2 / (gsd_full * gsd_full)
+        # GSD of the input mask (may differ from gsd_full if mask is downscaled)
+        gsd_mask = georect.gsd_m * (W_full / max(W_orig, 1))
+        min_area_px = min_floe_area_m2 / (gsd_mask * gsd_mask)
         binary_full = _remove_small_blobs(binary_full, min_area_px)
 
     # Downscale (nearest neighbour to preserve binary values)
@@ -278,15 +298,23 @@ def find_route(
     # Zero out cost inside ice (should not be visited anyway)
     proximity_cost[dilated_bool] = 0.0
 
+    # ---- Latitude grid for geographic N/S endpoint detection ----
+    # Map routing pixel (r, c) → full-res pixel using col_to_full / row_to_full
+    rows_g, cols_g = np.mgrid[:H_proc, :W_proc]
+    u_full_g = cols_g.ravel().astype(np.float64) * col_to_full
+    v_full_g = rows_g.ravel().astype(np.float64) * row_to_full
+    lat_grid_proc, _ = _pixel_to_latlon(u_full_g, v_full_g, georect)
+    lat_grid_proc = lat_grid_proc.reshape(H_proc, W_proc)
+
     # ---- Start / end points ----
     if start_latlon is None:
-        start_rc = _find_auto_endpoint(navigable, northmost=True)
+        start_rc = _find_auto_endpoint_geo(navigable, lat_grid_proc, northmost=True)
     else:
         start_rc = _latlon_to_pixel(start_latlon[0], start_latlon[1],
                                     georect, H_proc, W_proc)
 
     if end_latlon is None:
-        end_rc = _find_auto_endpoint(navigable, northmost=False)
+        end_rc = _find_auto_endpoint_geo(navigable, lat_grid_proc, northmost=False)
     else:
         end_rc = _latlon_to_pixel(end_latlon[0], end_latlon[1],
                                   georect, H_proc, W_proc)
@@ -347,9 +375,9 @@ def find_route(
     wp_u = np.array([p[0] for p in wp_colrow], dtype=np.float64)  # col
     wp_v = np.array([p[1] for p in wp_colrow], dtype=np.float64)  # row
 
-    # Scale pixel coordinates back to full-res before lat/lon conversion
-    wp_u_full = wp_u / routing_scale
-    wp_v_full = wp_v / routing_scale
+    # Map routing pixel → full-res pixel using the same ratio as the lat grid
+    wp_u_full = wp_u * col_to_full
+    wp_v_full = wp_v * row_to_full
 
     lat_wp, lon_wp = _pixel_to_latlon(wp_u_full, wp_v_full, georect)
     waypoints = [(float(lat_wp[i]), float(lon_wp[i])) for i in range(len(wp_u))]
