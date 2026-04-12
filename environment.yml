@@ -16,6 +16,7 @@ dependencies:
   - rasterio
   - pyproj
   - shapely
+  - geopandas
   - ruff
   - mypy
   - pytest
