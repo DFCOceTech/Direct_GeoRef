@@ -1,0 +1,25 @@
+name: direct-georef
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - pillow
+  - opencv
+  - jupyterlab
+  - ipywidgets
+  - folium
+  - rasterio
+  - pyproj
+  - shapely
+  - ruff
+  - mypy
+  - pytest
+  - pip
+  - pip:
+    - piexif
+    - python-xmp-toolkit
