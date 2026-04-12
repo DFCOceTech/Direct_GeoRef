@@ -126,8 +126,14 @@ def georectify(
     -------
     GeoRect with pixel-level coordinate arrays and corner/footprint info.
     """
-    # Flying height above the reference plane
-    h = meta.flying_height_m  # uses relative altitude when available
+    # Flying height above the reference plane  (REQ-GEO-003)
+    # Priority:
+    #   1. altitude_rel_m  — DJI relative altitude (AGL); directly usable
+    #   2. altitude_abs_m − surface_altitude_m — for AMSL-only sources (e.g. Phase One)
+    if meta.altitude_rel_m is not None:
+        h = meta.altitude_rel_m
+    else:
+        h = meta.altitude_abs_m - surface_altitude_m
 
     if h <= 0.0:
         raise ValueError(f"Flying height must be positive, got {h} m")
@@ -138,9 +144,12 @@ def georectify(
         raise ValueError("Image dimensions unknown — set camera.width/height or pass via metadata")
 
     # --- Rotation matrix: Camera → NED ---
-    yaw   = meta.gimbal_yaw   or 0.0
-    pitch = meta.gimbal_pitch or -90.0   # assume nadir if missing
-    roll  = meta.gimbal_roll  or 0.0
+    # Use `is not None` guards (not `or`) so that legitimate 0.0 values are preserved.
+    # gimbal_pitch=0.0 means a horizontal/oblique camera; `or -90.0` would silently
+    # treat it as nadir.  REQ-GEO-004 / REQ-META-005.
+    yaw   = meta.gimbal_yaw   if meta.gimbal_yaw   is not None else 0.0
+    pitch = meta.gimbal_pitch if meta.gimbal_pitch is not None else -90.0
+    roll  = meta.gimbal_roll  if meta.gimbal_roll  is not None else 0.0
     R = _rotation_camera_to_ned(yaw, pitch, roll)
 
     # --- Camera-origin geographic position ---

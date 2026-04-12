@@ -2,10 +2,11 @@
 
 Represents a pinhole camera with optional radial/tangential distortion.
 Supports loading calibration parameters from:
-  - OpenCV  : YAML or JSON produced by cv2.FileStorage
-  - Agisoft : XML exported from Metashape camera calibration
-  - Pix4D   : _pix4d_camera_internals.csv or camera.xml
-  - EXIF    : Focal length + known sensor dimensions (fallback)
+  - Sensor spec : focal length (mm) + physical sensor dimensions (mm) — REQ-CAM-005
+  - OpenCV      : YAML or JSON produced by cv2.FileStorage
+  - Agisoft     : XML exported from Metashape camera calibration
+  - Pix4D       : _pix4d_camera_internals.csv or camera.xml
+  - EXIF        : Focal length + sensor DB lookup (DJI and Phase One models)
 
 All parameters are stored in pixel units referenced to the image coordinate
 system where (0,0) is the top-left corner of the top-left pixel.
@@ -107,21 +108,71 @@ class CameraModel:
 
 # Sensor sizes for common DJI cameras (mm)
 _DJI_SENSORS: dict[str, tuple[float, float]] = {
-    "FC300C": (6.17, 4.55),   # Phantom 3 Adv/Pro (1/2.3")
-    "FC300X": (6.17, 4.55),   # Phantom 3 (1/2.3")
-    "FC330":  (6.17, 4.55),   # Phantom 4 (1/2.3")
-    "FC6310": (13.2, 8.8),    # Phantom 4 Pro (1")
-    "FC220":  (6.17, 4.55),   # Mavic Pro (1/2.3")
-    "FC350":  (17.3, 13.0),   # Inspire 1 X5
-    "FC550":  (17.3, 13.0),   # Inspire 1 X5R
-    "L1D-20c": (13.2, 8.8),   # Mavic 2 Pro (1")
-    "FC7303": (6.3,  4.7),    # Mini 2
+    "FC300C":  (6.17,  4.55),   # Phantom 3 Adv/Pro (1/2.3")
+    "FC300X":  (6.17,  4.55),   # Phantom 3 (1/2.3")
+    "FC330":   (6.17,  4.55),   # Phantom 4 (1/2.3")
+    "FC6310":  (13.2,  8.8),    # Phantom 4 Pro (1")
+    "FC220":   (6.17,  4.55),   # Mavic Pro (1/2.3")
+    "FC350":   (17.3,  13.0),   # Inspire 1 X5
+    "FC550":   (17.3,  13.0),   # Inspire 1 X5R
+    "L1D-20c": (13.2,  8.8),    # Mavic 2 Pro (1")
+    "FC7303":  (6.3,   4.7),    # Mini 2
+}
+
+# Sensor sizes for Phase One aerial cameras (mm) — REQ-CAM-006
+_AERIAL_SENSORS: dict[str, tuple[float, float]] = {
+    "IXM-100":    (43.9, 32.9),   # 100 MP BSI medium-format (11664 × 8750 px)
+    "IXM-50":     (43.9, 32.9),   # 50 MP variant, same sensor die
+    "IXM-RS150F": (53.4, 40.0),   # 150 MP (16352 × 12288 px)
+    "iXM-100":    (43.9, 32.9),   # alternate capitalisation
+    "iXM-50":     (43.9, 32.9),
 }
 
 
 # ---------------------------------------------------------------------------
 # Loaders
 # ---------------------------------------------------------------------------
+
+def from_sensor_spec(
+    focal_length_mm: float,
+    sensor_width_mm: float,
+    sensor_height_mm: float,
+    image_width: int,
+    image_height: int,
+) -> CameraModel:
+    """Build CameraModel from physical sensor specification.
+
+    Use this when the focal length is known from operator records or a
+    separate calibration report, and the sensor dimensions are available
+    from the manufacturer's datasheet.  No EXIF or database lookup required.
+
+    This is the preferred loader for non-DJI systems (e.g. Phase One iXM)
+    where focal length is not embedded in EXIF.  (REQ-CAM-005)
+
+    Parameters
+    ----------
+    focal_length_mm : nominal or calibrated focal length in millimetres
+    sensor_width_mm : physical sensor width in millimetres
+    sensor_height_mm : physical sensor height in millimetres
+    image_width, image_height : image dimensions in pixels
+
+    Returns
+    -------
+    CameraModel with principal point at image centre (no distortion assumed).
+    """
+    px = sensor_width_mm  / image_width   # mm per pixel, x
+    py = sensor_height_mm / image_height  # mm per pixel, y
+    fx = focal_length_mm / px
+    fy = focal_length_mm / py
+    cx = image_width  / 2.0
+    cy = image_height / 2.0
+
+    return CameraModel(
+        fx=fx, fy=fy, cx=cx, cy=cy,
+        width=image_width, height=image_height,
+        label=f"sensor_spec ({focal_length_mm:.1f}mm / {sensor_width_mm}×{sensor_height_mm}mm)",
+    )
+
 
 def from_exif(
     focal_length_mm: float,
@@ -135,15 +186,15 @@ def from_exif(
 
     Sensor size is resolved in priority order:
       1. Explicit ``sensor_width_mm`` / ``sensor_height_mm`` arguments
-      2. Known sensor lookup by ``model`` (DJI camera database)
-      3. Derive from 35mm-equivalent (not available here — pass 35mm_equiv if needed)
+      2. Known sensor lookup by ``model`` (DJI database, then Phase One database)
+      3. Raises ValueError if no sensor size can be determined
 
     Parameters
     ----------
     focal_length_mm : focal length in millimetres (from EXIF FocalLength tag)
     image_width, image_height : sensor dimensions in pixels
     sensor_width_mm, sensor_height_mm : physical sensor size (optional)
-    model : camera model string for database lookup (e.g. "FC300C")
+    model : camera model string for database lookup (e.g. "FC300C" or "IXM-100")
     """
     # Resolve sensor size
     sw, sh = sensor_width_mm, sensor_height_mm
@@ -152,11 +203,13 @@ def from_exif(
         key = clean.split()[0] if clean else ""
         if key in _DJI_SENSORS:
             sw, sh = _DJI_SENSORS[key]
+        elif key in _AERIAL_SENSORS:
+            sw, sh = _AERIAL_SENSORS[key]
 
     if sw is None or sh is None:
         raise ValueError(
             f"Cannot determine sensor size for model '{model}'. "
-            "Pass sensor_width_mm and sensor_height_mm explicitly."
+            "Pass sensor_width_mm and sensor_height_mm explicitly, or use from_sensor_spec()."
         )
 
     # Pixel pitch (mm/px)

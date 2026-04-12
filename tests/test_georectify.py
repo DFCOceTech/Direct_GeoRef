@@ -7,12 +7,17 @@ REQ-GEO-004: Rotation matrix third column is Down (0,0,1) for pure-nadir camera
 REQ-GEO-005: Zero yaw/pitch=-90/roll=0 → corners are symmetric around camera
 REQ-GEO-006: Flying height <= 0 raises ValueError
 REQ-GEO-007: Yaw rotation shifts footprint heading, not position of centre pixel
+
+Non-DJI additions (Epic 01):
+REQ-GEO-003 (new): surface_altitude_m applied to AMSL when altitude_rel_m is None — SCENARIO-GEO-002
+REQ-GEO-004 (new): Phase One aerialgps yaw/pitch/roll maps correctly — SCENARIO-GEO-001
+REQ-GEO-004 (new): yaw 0–360° range treated identically to ±180° range
 """
 
 import numpy as np
 import pytest
 
-from direct_georef.camera import CameraModel
+from direct_georef.camera import CameraModel, from_sensor_spec
 from direct_georef.georectify import georectify, _rotation_camera_to_ned
 from direct_georef.metadata import ImageMetadata
 
@@ -23,6 +28,18 @@ def _make_meta(lat=64.0, lon=-50.0, alt_rel=100.0,
         path="synthetic.jpg",
         latitude=lat, longitude=lon, altitude_abs_m=alt_rel,
         altitude_rel_m=alt_rel,
+        gimbal_yaw=yaw, gimbal_pitch=pitch, gimbal_roll=roll,
+        image_width=4000, image_height=3000,
+    )
+
+
+def _make_meta_abs(lat=64.0, lon=-50.0, alt_abs=841.0,
+                   yaw=0.0, pitch=-90.0, roll=0.0) -> ImageMetadata:
+    """Meta with altitude_rel_m=None — simulates non-DJI image using AMSL."""
+    return ImageMetadata(
+        path="synthetic.jpg",
+        latitude=lat, longitude=lon, altitude_abs_m=alt_abs,
+        altitude_rel_m=None,
         gimbal_yaw=yaw, gimbal_pitch=pitch, gimbal_roll=roll,
         image_width=4000, image_height=3000,
     )
@@ -149,3 +166,79 @@ class TestGeoRectify:
         assert result.lat_grid is None
         assert result.lon_grid is None
         assert len(result.corners_latlon) == 4
+
+
+class TestSurfaceAltitude:
+    """REQ-GEO-003 (new): surface_altitude_m applied when altitude_rel_m is None."""
+
+    def test_surface_altitude_applied_for_amsl(self):
+        """SCENARIO-GEO-002: h = alt_abs - surface_alt when altitude_rel_m is None."""
+        # alt_abs=500, surface=100 → flying height should be 400
+        meta = _make_meta_abs(alt_abs=500.0)
+        cam = _make_cam()
+        result = georectify(meta, cam, surface_altitude_m=100.0, full_grid=False)
+        assert abs(result.flying_height_m - 400.0) < 0.01, \
+            f"Expected 400 m flying height, got {result.flying_height_m}"
+
+    def test_surface_altitude_zero_default(self):
+        """surface_altitude_m=0 → flying_height = altitude_abs_m."""
+        meta = _make_meta_abs(alt_abs=841.083)
+        cam = _make_cam()
+        result = georectify(meta, cam, surface_altitude_m=0.0, full_grid=False)
+        assert abs(result.flying_height_m - 841.083) < 0.01
+
+    def test_relative_altitude_takes_priority(self):
+        """altitude_rel_m always wins over AMSL calculation, surface_alt ignored."""
+        meta = _make_meta(alt_rel=180.0)  # altitude_rel_m=180, altitude_abs_m=180
+        meta.altitude_abs_m = 841.0       # set abs to something very different
+        cam = _make_cam()
+        result = georectify(meta, cam, surface_altitude_m=0.0, full_grid=False)
+        assert abs(result.flying_height_m - 180.0) < 0.01
+
+
+class TestPhaseOneConventions:
+    """REQ-GEO-004 (new): Phase One aerialgps: angle convention is DJI-compatible."""
+
+    def test_nadir_pitch_minus_90_is_nadir(self):
+        """aerialgps:GPSIMUPitch=-90.807° produces a near-nadir footprint.
+
+        Corner-averaging a wide-angle camera at non-nadir gives a perspective-
+        distorted centroid tens of meters from the nadir point.  We therefore
+        use a narrow-FOV camera (tiny image) so perspective error is negligible,
+        and verify the footprint centroid is within 5 m of the camera GPS.
+        """
+        meta = _make_meta(yaw=301.57, pitch=-90.807, roll=0.238)
+        # Narrow-FOV camera: 10×10 px → each corner only ~0.2° off-axis
+        cam_narrow = CameraModel(
+            fx=2340.0, fy=2340.0, cx=5.0, cy=5.0, width=10, height=10
+        )
+        result = georectify(meta, cam_narrow, full_grid=False)
+        c = result.corners_latlon
+        centre_lat = (c['TL'][0] + c['TR'][0] + c['BL'][0] + c['BR'][0]) / 4
+        centre_lon = (c['TL'][1] + c['TR'][1] + c['BL'][1] + c['BR'][1]) / 4
+        d = _dist_m((centre_lat, centre_lon), (meta.latitude, meta.longitude))
+        # 0.807° off-nadir at 100m → ~1.4m nadir shift; 5m gives generous margin
+        assert d < 5.0, f"Footprint centre {d:.1f} m from camera GPS (expected <5 m)"
+
+    def test_yaw_360_equivalent_to_yaw_0(self):
+        """Yaw=360° is identical to yaw=0° (trig functions are 2π-periodic)."""
+        meta0   = _make_meta(yaw=0.0)
+        meta360 = _make_meta(yaw=360.0)
+        cam = _make_cam()
+        r0   = georectify(meta0,   cam, full_grid=False)
+        r360 = georectify(meta360, cam, full_grid=False)
+        for corner in ('TL', 'TR', 'BL', 'BR'):
+            assert abs(r0.corners_latlon[corner][0] - r360.corners_latlon[corner][0]) < 1e-8
+            assert abs(r0.corners_latlon[corner][1] - r360.corners_latlon[corner][1]) < 1e-8
+
+    def test_phase_one_full_pipeline_gsd(self):
+        """SCENARIO-GEO-001: Phase One iXM-100 at 841 m → GSD ≈ 9 cm."""
+        meta = _make_meta_abs(
+            lat=78.81890, lon=-0.67384,
+            alt_abs=841.083,
+            yaw=301.571, pitch=-90.807, roll=0.238,
+        )
+        cam = from_sensor_spec(35.0, 43.9, 32.9, 11664, 8750)
+        result = georectify(meta, cam, surface_altitude_m=0.0, full_grid=False)
+        assert 0.08 < result.gsd_m < 0.10, f"GSD {result.gsd_m:.4f} m/px out of range"
+        assert abs(result.flying_height_m - 841.083) < 0.01

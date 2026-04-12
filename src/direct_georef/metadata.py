@@ -1,12 +1,25 @@
 """Extract GPS position and camera orientation from drone image metadata.
 
-Reads standard EXIF GPS tags plus DJI-specific XMP fields.
-Supports any drone that follows the drone-dji XMP namespace convention
-(Phantom 3/4, Mavic series, Inspire, Mini, etc.).
+Reads standard EXIF GPS tags plus vendor XMP fields.  Supports:
 
-Returned orientation angles follow the DJI convention:
-  Yaw   : degrees from North, clockwise (0 = North, 90 = East, -90/270 = West)
-  Pitch : degrees; 0 = horizontal, -90 = straight down (nadir)
+  DJI (Phantom 3/4, Mavic, Inspire, Mini, …)
+      XMP namespace: ``drone-dji:``
+      Fields: GimbalYawDegree, GimbalPitchDegree, GimbalRollDegree,
+              FlightYawDegree, FlightPitchDegree, FlightRollDegree,
+              RelativeAltitude
+
+  Phase One / Orthodrone (iXM series, processed via Capture One)
+      XMP namespaces: ``aerialgps:`` (primary) and ``Camera:`` (fallback)
+      aerialgps fields: GPSIMUYaw, GPSIMUPitch, GPSIMURoll (rational strings,
+                        e.g. "3015708/10000"); GPSIMUYawRef
+      Camera fields: Yaw, Pitch, Roll (floating-point degrees)
+      Note: aerialgps:GPSIMUPitch uses the same convention as DJI
+            (0° = horizontal, −90° = nadir).  Camera:Pitch is nadir-relative
+            (0° = nadir); converted by: gimbal_pitch = Camera:Pitch − 90°.
+
+All returned orientation angles follow the NED convention used by georectify:
+  Yaw   : degrees from True North, clockwise (0 = N, 90 = E); 0–360 or ±180
+  Pitch : degrees; 0 = horizontal, −90 = straight down (nadir)
   Roll  : degrees; 0 = level, positive = right-wing-down
 """
 
@@ -71,14 +84,14 @@ class ImageMetadata:
     longitude: float       # decimal degrees, positive = East
     altitude_abs_m: float  # EXIF GPSAltitude (absolute, AMSL)
 
-    # DJI XMP — may be absent on non-DJI cameras
-    altitude_rel_m: Optional[float] = None   # relative above takeoff point
-    gimbal_yaw: Optional[float] = None       # camera heading (deg from N, CW)
-    gimbal_pitch: Optional[float] = None     # camera tilt (deg; -90 = nadir)
-    gimbal_roll: Optional[float] = None      # camera roll (deg)
-    flight_yaw: Optional[float] = None       # drone body heading
-    flight_pitch: Optional[float] = None     # drone body pitch
-    flight_roll: Optional[float] = None      # drone body roll
+    # Orientation — populated from DJI or Phase One XMP; None if absent
+    altitude_rel_m: Optional[float] = None   # relative above takeoff point (DJI) or ATO (Phase One)
+    gimbal_yaw: Optional[float] = None       # camera heading, deg from True N, CW
+    gimbal_pitch: Optional[float] = None     # camera tilt, deg; 0 = level, -90 = nadir
+    gimbal_roll: Optional[float] = None      # camera roll, deg; 0 = level, +ve = right-wing-down
+    flight_yaw: Optional[float] = None       # platform body heading
+    flight_pitch: Optional[float] = None     # platform body pitch
+    flight_roll: Optional[float] = None      # platform body roll
 
     # Camera info
     make: str = ""
@@ -161,8 +174,8 @@ def read_metadata(image_path: str | Path) -> ImageMetadata:
         image_height=int(h) if h is not None else None,
     )
 
-    # --- DJI XMP ---
-    _parse_dji_xmp(path, meta)
+    # --- XMP (namespace-dispatched) ---
+    _parse_xmp(path, meta)
 
     return meta
 
@@ -180,8 +193,26 @@ def _parse_dms(dms_tuple, ref: str) -> float:
     return dd
 
 
-def _parse_dji_xmp(path: Path, meta: ImageMetadata) -> None:
-    """Parse DJI XMP block and populate orientation fields in-place."""
+def _eval_rational(s: str) -> Optional[float]:
+    """Parse a rational string like '3015708/10000' or a plain float string.
+
+    Returns None if the string cannot be parsed.
+    """
+    s = s.strip()
+    if "/" in s:
+        parts = s.split("/", 1)
+        try:
+            return float(parts[0]) / float(parts[1])
+        except (ValueError, ZeroDivisionError):
+            return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_xmp(path: Path, meta: ImageMetadata) -> None:
+    """Read XMP block from a JPEG, detect vendor namespace, dispatch to parser."""
     with open(path, "rb") as f:
         raw = f.read()
 
@@ -191,6 +222,18 @@ def _parse_dji_xmp(path: Path, meta: ImageMetadata) -> None:
     xmp_end = raw.find(b"</x:xmpmeta>", xmp_start) + len(b"</x:xmpmeta>")
     xmp = raw[xmp_start:xmp_end].decode("utf-8", errors="replace")
 
+    if "drone-dji:" in xmp:
+        _parse_dji_xmp(xmp, meta)
+    elif "aerialgps:" in xmp or 'xmlns:Camera="http://www.phaseone.com' in xmp:
+        _parse_phaseone_xmp(xmp, meta)
+    # else: no recognised orientation namespace — orientation fields stay None
+
+
+def _parse_dji_xmp(xmp: str, meta: ImageMetadata) -> None:
+    """Populate orientation from DJI ``drone-dji:`` XMP namespace.
+
+    REQ-META-002
+    """
     def _attr(name: str) -> Optional[float]:
         m = re.search(rf'{name}="([+-]?\d+(?:\.\d+)?)"', xmp)
         return float(m.group(1)) if m else None
@@ -202,3 +245,69 @@ def _parse_dji_xmp(path: Path, meta: ImageMetadata) -> None:
     meta.flight_yaw   = _attr("drone-dji:FlightYawDegree")
     meta.flight_pitch = _attr("drone-dji:FlightPitchDegree")
     meta.flight_roll  = _attr("drone-dji:FlightRollDegree")
+
+
+def _parse_phaseone_xmp(xmp: str, meta: ImageMetadata) -> None:
+    """Populate orientation from Phase One / Orthodrone XMP namespaces.
+
+    Primary source: ``aerialgps:`` namespace (GPSIMUYaw/Pitch/Roll).
+    Values are rational strings (e.g. "3015708/10000") or plain floats.
+
+    Fallback: ``Camera:`` namespace (Yaw/Pitch/Roll as plain floats).
+    Camera:Pitch uses nadir-relative convention (0 = nadir); converted to
+    DJI convention by: gimbal_pitch = Camera:Pitch - 90°.
+
+    REQ-META-003, REQ-META-004, REQ-META-006
+    """
+    def _rational_attr(name: str) -> Optional[float]:
+        """Match name="value" where value may be a rational like '3015708/10000'."""
+        m = re.search(rf'{re.escape(name)}="([^"]+)"', xmp)
+        return _eval_rational(m.group(1)) if m else None
+
+    def _float_attr(name: str) -> Optional[float]:
+        m = re.search(rf'{re.escape(name)}="([+-]?\d+(?:\.\d+)?)"', xmp)
+        return float(m.group(1)) if m else None
+
+    # --- Primary: aerialgps: namespace ---
+    imu_yaw   = _rational_attr("aerialgps:GPSIMUYaw")
+    imu_pitch = _rational_attr("aerialgps:GPSIMUPitch")
+    imu_roll  = _rational_attr("aerialgps:GPSIMURoll")
+
+    # Warn if yaw reference is magnetic (M); True (T) is assumed
+    yaw_ref_m = re.search(r'aerialgps:GPSIMUYawRef="([^"]+)"', xmp)
+    if yaw_ref_m and yaw_ref_m.group(1).upper() == "M":
+        import warnings
+        warnings.warn(
+            "aerialgps:GPSIMUYawRef is 'M' (magnetic); georectification "
+            "assumes True North. Results will be offset by magnetic declination.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    if imu_yaw is not None:
+        meta.gimbal_yaw   = imu_yaw
+        meta.gimbal_pitch = imu_pitch   # same convention as DJI: 0=level, -90=nadir
+        meta.gimbal_roll  = imu_roll
+
+    # --- Fallback: Camera: namespace ---
+    if meta.gimbal_yaw is None:
+        cam_yaw   = _float_attr("Camera:Yaw")
+        cam_pitch = _float_attr("Camera:Pitch")   # 0° = nadir (nadir-relative)
+        cam_roll  = _float_attr("Camera:Roll")
+
+        if cam_yaw is not None:
+            meta.gimbal_yaw  = cam_yaw
+            # Convert nadir-relative pitch to DJI convention (0=level, -90=nadir)
+            meta.gimbal_pitch = (cam_pitch - 90.0) if cam_pitch is not None else None
+            meta.gimbal_roll  = cam_roll
+
+    # --- Flight body angles from aerialgps: ---
+    meta.flight_yaw   = _rational_attr("aerialgps:GPSIMUFlightYaw")
+    meta.flight_pitch = _rational_attr("aerialgps:GPSIMUFlightPitch")
+    meta.flight_roll  = _rational_attr("aerialgps:GPSIMUFlightRoll")
+
+    # NOTE: aerialgps:GPSAltitudeAboveTakeOff is NOT stored as altitude_rel_m.
+    # Unlike DJI RelativeAltitude (which is reliable AGL), this value is relative
+    # to the aircraft's takeoff point elevation, not to the terrain below the image.
+    # Flying height is computed in georectify() as: altitude_abs_m - surface_altitude_m.
+    # Callers who know their terrain elevation should pass it as surface_altitude_m.
