@@ -1,6 +1,6 @@
 # Camera Model — Specification
 
-> Version: 1.1 | Status: Implemented | Last updated: 2026-04-12
+> Version: 1.2 | Status: Implemented | Last updated: 2026-04-25
 
 ## Purpose
 
@@ -27,7 +27,9 @@ The system SHALL provide loaders for:
 ### REQ-CAM-004: EXIF + Sensor Lookup
 The system SHALL provide `from_exif(focal_length_mm, image_width, image_height, model=...)`
 that resolves sensor size via a built-in database of known DJI and Phase One camera models
-and converts focal length in mm to pixels.
+and converts focal length in mm to pixels. The DJI sensor database SHALL include at minimum:
+FC300C/FC300X/FC330 (Phantom 3/4, 1/2.3"), FC6310 (Phantom 4 Pro, 1"), FC220 (Mavic Pro),
+FC350/FC550 (Inspire X5), L1D-20c (Mavic 2 Pro, 1"), FC7303 (Mini 2), FC3582 (Mini 3, 1/1.3").
 
 ### REQ-CAM-005: Explicit Sensor Spec
 The system SHALL provide `from_sensor_spec(focal_length_mm, sensor_width_mm,
@@ -68,7 +70,12 @@ When no explicit principal point is available, the system SHALL default to image
 **WHEN** `from_exif()` is called
 **THEN** `ValueError` is raised naming the model
 
-## Implementation Status (2026-04-12)
+### SCENARIO-CAM-005: from_exif — DJI Mini 3 (FC3582) lookup
+**GIVEN** focal_length_mm=6.72, model="FC3582", image_width=4032, image_height=3024
+**WHEN** `from_exif()` is called
+**THEN** fx ≈ 2808 px, fy ≈ 2807 px, cx=2016, cy=1512 within ±1 px (sensor 9.65 × 7.24 mm)
+
+## Implementation Status (2026-04-25)
 
 **Status**: Implemented
 
@@ -76,9 +83,10 @@ When no explicit principal point is available, the system SHALL default to image
 - `src/direct_georef/camera.py:CameraModel` — covers REQ-CAM-001, 002
 - `src/direct_georef/camera.py:from_opencv/agisoft_xml/pix4d_csv()` — covers REQ-CAM-003
 - `src/direct_georef/camera.py:from_exif()` — covers REQ-CAM-004
-- `src/direct_georef/camera.py:from_sensor_spec()` — covers REQ-CAM-005 (new)
-- Phase One entries in `_AERIAL_SENSORS` dict — covers REQ-CAM-006 (new)
+- `src/direct_georef/camera.py:from_sensor_spec()` — covers REQ-CAM-005
+- Phase One entries in `_AERIAL_SENSORS` dict — covers REQ-CAM-006
 - Principal point default — covers REQ-CAM-007
+- `_DJI_SENSORS["FC3582"] = (9.65, 7.24)` — extends REQ-CAM-004 for DJI Mini 3 (SCENARIO-CAM-005)
 
 ### Deviations from Spec
 - None

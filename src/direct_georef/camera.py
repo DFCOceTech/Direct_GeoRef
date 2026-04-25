@@ -117,6 +117,7 @@ _DJI_SENSORS: dict[str, tuple[float, float]] = {
     "FC550":   (17.3,  13.0),   # Inspire 1 X5R
     "L1D-20c": (13.2,  8.8),    # Mavic 2 Pro (1")
     "FC7303":  (6.3,   4.7),    # Mini 2
+    "FC3582":  (9.65,  7.24),  # Mini 3 (1/1.3")
 }
 
 # Sensor sizes for Phase One aerial cameras (mm) — REQ-CAM-006

@@ -2,6 +2,17 @@
 
 Rolling 2-week work log. Remove entries older than 2 weeks.
 
+## 2026-04-25 — DJI Mini 3 sensor support
+
+### Sensor database extension (`camera.py`)
+- Added `"FC3582": (9.65, 7.24)` to `_DJI_SENSORS` — DJI Mini 3 (1/1.3" sensor)
+- `from_exif(model="FC3582", ...)` now resolves automatically; no explicit sensor args required
+- Tested against `DJI_0179.JPG` (FC3582, f=6.72 mm, 4032×3024): fx≈2808, fy≈2807 px
+
+### Spec updated
+- `spec-anchor/openspec/capabilities/camera-model/spec.md` — extended REQ-CAM-004 to enumerate
+  all DJI sensor entries; added SCENARIO-CAM-005 for FC3582; bumped to v1.2
+
 ## 2026-04-12 — Epic 02: Output and Analysis
 
 ### New module: `vector.py`

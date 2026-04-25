@@ -1,6 +1,6 @@
 # Operational Status — Direct_GeoRef
 
-> Last updated: 2026-04-12
+> Last updated: 2026-04-25
 
 ## Session Handoff Protocol (MANDATORY)
 
@@ -17,7 +17,7 @@ Before your session ends or when you complete significant work, update:
 - Phase One / Orthodrone `aerialgps:` XMP orientation parsing (primary)
 - Phase One `Camera:` XMP orientation parsing (fallback, with convention conversion)
 - `from_sensor_spec()` — build CameraModel directly from focal length + physical sensor dims
-- `from_exif()` — sensor lookup for DJI models and Phase One iXM (43.9×32.9 mm)
+- `from_exif()` — sensor lookup for DJI models (incl. Mini 3 / FC3582) and Phase One iXM
 - `from_opencv()`, `from_agisoft_xml()`, `from_pix4d_csv()` calibration file loaders
 - Flat-earth direct georectification with ZYX rotation (yaw/pitch/roll → NED)
 - `surface_altitude_m` parameter properly applied when `altitude_rel_m` is None
